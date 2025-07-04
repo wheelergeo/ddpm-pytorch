@@ -9,6 +9,7 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10
 from torchvision.utils import save_image
 
+import Utils
 from Diffusion import GaussianDiffusionSampler, GaussianDiffusionTrainer
 from Diffusion.Model import UNet
 from Scheduler import GradualWarmupScheduler
@@ -54,6 +55,9 @@ def train(modelConfig: Dict):
                 map_location=device
             )
         )
+        e_start = Utils.last_epoch_from_filename(modelConfig["training_load_weight"]) + 1
+        assert e_start < modelConfig["epoch"]
+        print(f"Resume training from the epoch {e_start} checkpoint")
     # AdamW optimizer decoupled weight decay from the gradient update.
     optimizer = torch.optim.AdamW(
         net_model.parameters(), 
@@ -88,39 +92,44 @@ def train(modelConfig: Dict):
     ).to(device)
 
     # start training
-    for e in range(modelConfig["epoch"]):
-        # with用于管理tadm对象生命周期，创建调用__enter__()方法，返回一个迭代器对象tqdmDataLoader（开启进度条显示）
-        # 结束则调用__exit__()方法，自动处理异常和资源释放（关闭进度条显示）
-        with tqdm(dataloader, dynamic_ncols=True) as tqdmDataLoader:
-            for images, _ in tqdmDataLoader:
-                # train
-                optimizer.zero_grad()
-                x_0 = images.to(device)
-                loss = trainer(x_0).sum() / 1000.
-                loss.backward()
-                # 参数梯度裁剪，将参数梯度范数限制在modelConfig["grad_clip"]范围内，防止梯度爆炸
-                torch.nn.utils.clip_grad_norm_(
-                    net_model.parameters(), 
-                    modelConfig["grad_clip"]
-                )   # gradient clipping
-                optimizer.step()
-                # 在进度后追加显示自定义信息
-                tqdmDataLoader.set_postfix(
-                    ordered_dict={
-                        "epoch": e,
-                        "loss: ": loss.item(),
-                        "img shape: ": x_0.shape,
-                        "LR": optimizer.state_dict()['param_groups'][0]["lr"]
-                    }
+    try:
+        for e in range(e_start, modelConfig["epoch"]):
+            # with用于管理tadm对象生命周期，创建调用__enter__()方法，返回一个迭代器对象tqdmDataLoader（开启进度条显示）
+            # 结束则调用__exit__()方法，自动处理异常和资源释放（关闭进度条显示）
+            with tqdm(dataloader, dynamic_ncols=True) as tqdmDataLoader:
+                for images, _ in tqdmDataLoader:
+                    # train
+                    optimizer.zero_grad()
+                    x_0 = images.to(device)
+                    loss = trainer(x_0).sum() / 1000.
+                    loss.backward()
+                    # 参数梯度裁剪，将参数梯度范数限制在modelConfig["grad_clip"]范围内，防止梯度爆炸
+                    torch.nn.utils.clip_grad_norm_(
+                        net_model.parameters(), 
+                        modelConfig["grad_clip"]
+                    )   # gradient clipping
+                    optimizer.step()
+                    # 在进度后追加显示自定义信息
+                    tqdmDataLoader.set_postfix(
+                        ordered_dict={
+                            "epoch": e,
+                            "loss: ": loss.item(),
+                            "img shape: ": x_0.shape,
+                            "LR": optimizer.state_dict()['param_groups'][0]["lr"]
+                        }
+                    )
+            warmUpScheduler.step()
+            torch.save(
+                net_model.state_dict(), 
+                os.path.join(
+                    modelConfig["save_weight_dir"], 
+                    'ckpt_' + str(e) + "_.pt"
                 )
-        warmUpScheduler.step()
-        torch.save(
-            net_model.state_dict(), 
-            os.path.join(
-                modelConfig["save_weight_dir"], 
-                'ckpt_' + str(e) + "_.pt"
             )
-        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Cleaning resources...")
+    finally:
+        pass
 
 def eval(modelConfig: Dict):
     # load model and evaluate
